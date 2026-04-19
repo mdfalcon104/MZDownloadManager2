@@ -213,96 +213,114 @@ extension MZDownloadManager: URLSessionDownloadDelegate {
     }
     
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        for (index, downloadModel) in self.downloadingArray.enumerated() {
-            if downloadTask.isEqual(downloadModel.task) {
-                DispatchQueue.main.async(execute: { () -> Void in
-                    
-                    let receivedBytesCount = Double(downloadTask.countOfBytesReceived)
-                    let totalBytesCount = Double(downloadTask.countOfBytesExpectedToReceive)
-                    let progress = Float(receivedBytesCount / totalBytesCount)
-                    
-                    let taskStartedDate = downloadModel.startTime ?? Date()
-                    let timeInterval = taskStartedDate.timeIntervalSinceNow
-                    let downloadTime = TimeInterval(-1 * timeInterval)
-                    
-                    let speed = Float(totalBytesWritten) / Float(downloadTime)
-                    
-                    let remainingContentLength = totalBytesExpectedToWrite - totalBytesWritten
-                    
-                    let speedInt64 = self.getSpeed(speed: speed)
-                    let remainingTime = remainingContentLength / speedInt64
-                    let hours = Int(remainingTime) / 3600
-                    let minutes = (Int(remainingTime) - hours * 3600) / 60
-                    let seconds = Int(remainingTime) - hours * 3600 - minutes * 60
-                    
-                    let totalFileSize = MZUtility.calculateFileSizeInUnit(totalBytesExpectedToWrite)
-                    let totalFileSizeUnit = MZUtility.calculateUnit(totalBytesExpectedToWrite)
-                    
-                    let downloadedFileSize = MZUtility.calculateFileSizeInUnit(totalBytesWritten)
-                    let downloadedSizeUnit = MZUtility.calculateUnit(totalBytesWritten)
-                    
-                    let speedSize = MZUtility.calculateFileSizeInUnit(speedInt64)
-                    let speedUnit = MZUtility.calculateUnit(speedInt64)
-                    
-                    downloadModel.remainingTime = (hours, minutes, seconds)
-                    downloadModel.file = (totalFileSize, totalFileSizeUnit as String)
-                    downloadModel.downloadedFile = (downloadedFileSize, downloadedSizeUnit as String)
-                    downloadModel.speed = (speedSize, speedUnit as String)
-                    downloadModel.progress = progress
-                    
-                    if self.downloadingArray.contains(downloadModel), let objectIndex = self.downloadingArray.index(of: downloadModel) {
-                        self.downloadingArray[objectIndex] = downloadModel
-                    }
-                    
-                    self.delegate?.downloadRequestDidUpdateProgress(downloadModel, index: index)
-                })
+        // Serialize all access to `downloadingArray` on the main queue to avoid
+        // racing with mutations from the public API (addDownloadTask, cancel,
+        // pause, resume) and from `didCompleteWithError`, which also dispatches
+        // to main. Previously this method iterated the array on the URLSession
+        // delegate queue, causing EXC_BAD_ACCESS via over-release under load.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            for (index, downloadModel) in self.downloadingArray.enumerated() {
+                guard downloadTask.isEqual(downloadModel.task) else { continue }
+
+                let receivedBytesCount = Double(downloadTask.countOfBytesReceived)
+                let totalBytesCount = Double(downloadTask.countOfBytesExpectedToReceive)
+                let progress = Float(receivedBytesCount / totalBytesCount)
+
+                let taskStartedDate = downloadModel.startTime ?? Date()
+                let timeInterval = taskStartedDate.timeIntervalSinceNow
+                let downloadTime = TimeInterval(-1 * timeInterval)
+
+                let speed = Float(totalBytesWritten) / Float(downloadTime)
+
+                let remainingContentLength = totalBytesExpectedToWrite - totalBytesWritten
+
+                let speedInt64 = self.getSpeed(speed: speed)
+                let remainingTime = speedInt64 > 0 ? remainingContentLength / speedInt64 : 0
+                let hours = Int(remainingTime) / 3600
+                let minutes = (Int(remainingTime) - hours * 3600) / 60
+                let seconds = Int(remainingTime) - hours * 3600 - minutes * 60
+
+                let totalFileSize = MZUtility.calculateFileSizeInUnit(totalBytesExpectedToWrite)
+                let totalFileSizeUnit = MZUtility.calculateUnit(totalBytesExpectedToWrite)
+
+                let downloadedFileSize = MZUtility.calculateFileSizeInUnit(totalBytesWritten)
+                let downloadedSizeUnit = MZUtility.calculateUnit(totalBytesWritten)
+
+                let speedSize = MZUtility.calculateFileSizeInUnit(speedInt64)
+                let speedUnit = MZUtility.calculateUnit(speedInt64)
+
+                downloadModel.remainingTime = (hours, minutes, seconds)
+                downloadModel.file = (totalFileSize, totalFileSizeUnit as String)
+                downloadModel.downloadedFile = (downloadedFileSize, downloadedSizeUnit as String)
+                downloadModel.speed = (speedSize, speedUnit as String)
+                downloadModel.progress = progress
+
+                if self.downloadingArray.contains(downloadModel), let objectIndex = self.downloadingArray.index(of: downloadModel) {
+                    self.downloadingArray[objectIndex] = downloadModel
+                }
+
+                self.delegate?.downloadRequestDidUpdateProgress(downloadModel, index: index)
                 break
             }
         }
     }
     
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        for (index, downloadModel) in downloadingArray.enumerated() {
-            if downloadTask.isEqual(downloadModel.task) {
-                let fileName = downloadModel.fileName as NSString
-                let basePath = downloadModel.destinationPath == "" ? MZUtility.baseFilePath : downloadModel.destinationPath
-                let destinationPath = (basePath as NSString).appendingPathComponent(fileName as String)
-                
-                let fileManager : FileManager = FileManager.default
-                
-                //If all set just move downloaded file to the destination
-                if fileManager.fileExists(atPath: basePath) {
-                    let fileURL = URL(fileURLWithPath: destinationPath as String)
-                    
-                    #if DEBUG
-                    debugPrint("directory path = \(destinationPath)")
-                    #endif
-                    
-                    do {
-                        try fileManager.moveItem(at: location, to: fileURL)
-                    } catch let error as NSError {
-                        #if DEBUG
-                        debugPrint("Error while moving downloaded file to destination path:\(error)")
-                        #endif
-                        DispatchQueue.main.async(execute: { () -> Void in
-                            self.delegate?.downloadRequestDidFailedWithError?(error, downloadModel: downloadModel, index: index)
-                        })
-                    }
-                } else {
-                    //Opportunity to handle the folder doesnot exists error appropriately.
-                    //Move downloaded file to destination
-                    //Delegate will be called on the session queue
-                    //Otherwise blindly give error Destination folder does not exists
-                    
-                    if let _ = self.delegate?.downloadRequestDestinationDoestNotExists {
-                        self.delegate?.downloadRequestDestinationDoestNotExists?(downloadModel, index: index, location: location)
-                    } else {
-                        let error = NSError(domain: "FolderDoesNotExist", code: 404, userInfo: [NSLocalizedDescriptionKey : "Destination folder does not exists"])
-                        self.delegate?.downloadRequestDidFailedWithError?(error, downloadModel: downloadModel, index: index)
-                    }
-                }
-                
+        // The temporary file at `location` is deleted by URLSession as soon as
+        // this delegate returns, so the move must happen synchronously on the
+        // session queue. Snapshot the matching model/index under the session
+        // queue, perform the file move, then hop to main for the delegate
+        // callbacks so downloadingArray access stays serialized with mutations.
+        var matchedModel: MZDownloadModel?
+        var matchedIndex: Int = 0
+        for (idx, model) in downloadingArray.enumerated() {
+            if downloadTask.isEqual(model.task) {
+                matchedModel = model
+                matchedIndex = idx
                 break
+            }
+        }
+
+        guard let downloadModel = matchedModel else { return }
+        let index = matchedIndex
+
+        let fileName = downloadModel.fileName as NSString
+        let basePath = downloadModel.destinationPath == "" ? MZUtility.baseFilePath : downloadModel.destinationPath
+        let destinationPath = (basePath as NSString).appendingPathComponent(fileName as String)
+
+        let fileManager: FileManager = FileManager.default
+
+        // If all set just move downloaded file to the destination
+        if fileManager.fileExists(atPath: basePath) {
+            let fileURL = URL(fileURLWithPath: destinationPath as String)
+
+            #if DEBUG
+            debugPrint("directory path = \(destinationPath)")
+            #endif
+
+            do {
+                try fileManager.moveItem(at: location, to: fileURL)
+            } catch let error as NSError {
+                #if DEBUG
+                debugPrint("Error while moving downloaded file to destination path:\(error)")
+                #endif
+                DispatchQueue.main.async { [weak self] in
+                    self?.delegate?.downloadRequestDidFailedWithError?(error, downloadModel: downloadModel, index: index)
+                }
+            }
+        } else {
+            // Opportunity to handle the folder-does-not-exist error appropriately.
+            // Delegate callbacks are dispatched to main to keep downloadingArray
+            // access serialized with the rest of the manager.
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                if let _ = self.delegate?.downloadRequestDestinationDoestNotExists {
+                    self.delegate?.downloadRequestDestinationDoestNotExists?(downloadModel, index: index, location: location)
+                } else {
+                    let error = NSError(domain: "FolderDoesNotExist", code: 404, userInfo: [NSLocalizedDescriptionKey: "Destination folder does not exists"])
+                    self.delegate?.downloadRequestDidFailedWithError?(error, downloadModel: downloadModel, index: index)
+                }
             }
         }
     }
